@@ -5,8 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PR Status Tracker</title>
 <style>
-  :root { --bg:#f7f7f8; --card:#fff; --text:#1f2328; --muted:#656d76; --border:#d0d7de; --accent:#0969da; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#0d1117; --card:#161b22; --text:#e6edf3; --muted:#8d96a0; --border:#30363d; --accent:#4493f8; } }
+  :root { --bg:#f7f7f8; --card:#fff; --text:#1f2328; --muted:#656d76; --border:#d0d7de; --accent:#0969da;
+          --new:#1a7f37; --new-bg:#dafbe1; --upd:#bf8700; --upd-bg:#fff8c5; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0d1117; --card:#161b22; --text:#e6edf3; --muted:#8d96a0; --border:#30363d; --accent:#4493f8;
+          --new:#3fb950; --new-bg:#12261e; --upd:#d29922; --upd-bg:#2b2111; } }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
   main { max-width: 1000px; margin: 0 auto; padding: 24px 16px; }
@@ -14,19 +16,34 @@
   .meta { color: var(--muted); font-size: 13px; }
   .bar { display:flex; gap:8px; margin:16px 0; flex-wrap:wrap; }
   input { flex:1; min-width:220px; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--card); color:var(--text); }
-  button { padding:8px 12px; border:1px solid var(--border); border-radius:6px; background:var(--card); color:var(--text); cursor:pointer; }
+  button { padding:8px 12px; border:1px solid var(--border); border-radius:6px; background:var(--card); color:var(--text); cursor:pointer; font:inherit; }
   button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
   .err { color:#cf222e; margin:8px 0; }
-  .group { margin-top: 20px; }
+  .tabs { display:flex; gap:4px; border-bottom:1px solid var(--border); margin-top:8px; overflow-x:auto; }
+  .tab { border:none; border-bottom:2px solid transparent; border-radius:0; background:none; padding:8px 12px; color:var(--muted); white-space:nowrap; }
+  .tab.on { color:var(--text); border-bottom-color:var(--accent); font-weight:600; }
+  .count { display:inline-block; min-width:18px; padding:0 6px; border-radius:9px; background:var(--upd); color:#fff; font-size:11px; line-height:18px; text-align:center; margin-left:4px; }
+  .sechead { display:flex; justify-content:space-between; align-items:center; margin:16px 0 4px; gap:8px; }
+  .sechead p { margin:0; color:var(--muted); font-size:13px; }
+  .group { margin-top: 16px; }
   .group h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; display:flex; align-items:center; gap:8px; }
-  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
-  .pr { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:6px; display:flex; gap:12px; align-items:center; }
+  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; flex:none; }
+  .pr { background:var(--card); border:1px solid var(--border); border-left:4px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:6px; display:flex; gap:12px; align-items:center; }
+  .pr.new { border-left-color:var(--new); background:var(--new-bg); }
+  .pr.update { border-left-color:var(--upd); background:var(--upd-bg); }
   .pr a { color:var(--text); text-decoration:none; font-weight:600; }
   .pr a:hover { color:var(--accent); }
   .pr .sub { color:var(--muted); font-size:12px; }
+  .pr .quote { font-size:13px; margin-top:4px; overflow-wrap:anywhere; }
+  .pr .quote a { font-weight:400; color:var(--muted); }
   .pr .grow { flex:1; min-width:0; }
-  .pr .x { padding:2px 8px; font-size:12px; }
+  .pr .actions { display:flex; gap:6px; flex:none; }
+  .pr .actions button { padding:3px 8px; font-size:12px; }
+  .label { display:inline-block; font-size:11px; font-weight:700; letter-spacing:.04em; padding:1px 7px; border-radius:10px; color:#fff; margin-right:6px; vertical-align:1px; }
+  .label.new { background:var(--new); }
+  .label.update { background:var(--upd); }
   .empty { color: var(--muted); padding: 24px 0; }
+  @media (max-width: 600px) { .pr { flex-wrap:wrap; } .pr .actions { width:100%; } }
 </style>
 </head>
 <body>
@@ -34,12 +51,13 @@
   <h1>PR Status Tracker</h1>
   <div class="meta" id="meta">Loading…</div>
   <div class="bar">
-    <input id="pr" placeholder="Add a PR: https://github.com/owner/repo/pull/123 or owner/repo#123">
+    <input id="pr" placeholder="Track a PR: https://github.com/owner/repo/pull/123 or owner/repo#123">
     <button class="primary" id="add">Track</button>
     <button id="refresh">Check now</button>
     <button id="test">Test pop-up</button>
   </div>
   <div class="err" id="err"></div>
+  <div class="tabs" id="tabs"></div>
   <div id="list"></div>
 </main>
 <script>
@@ -53,38 +71,101 @@ const ORDER = [
   ['Merged', '#8250df'],
   ['Closed', '#6e7781'],
 ];
+const SECTIONS = [
+  ['prs', 'My PRs'],
+  ['mentions', 'Mentioned'],
+  ['reviewing', 'Reviewing'],
+];
+let tab = 'prs', S = null;
+try { tab = localStorage.getItem('tab') || 'prs'; } catch {}
+
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]));
 const ago = iso => { if (!iso) return 'never'; const m = Math.round((Date.now() - Date.parse(iso)) / 60000); return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m/60)} h ago` : `${Math.round(m/1440)} d ago`; };
+const flagged = sec => Object.values(S?.[sec] || {}).filter(p => p.badge).length;
 
-async function load() {
-  const s = await (await fetch('/api/state')).json();
-  $('meta').textContent = `Last checked ${ago(s.lastPoll)} · every ${s.pollMinutes} min` + (s.trackMine ? ' · auto-tracking your open PRs' : '');
-  $('err').textContent = s.lastError ? `Last poll failed: ${s.lastError}` : '';
-  const entries = Object.entries(s.prs);
-  if (!entries.length) { $('list').innerHTML = '<div class="empty">No PRs tracked yet.</div>'; return; }
-  $('list').innerHTML = ORDER.map(([status, color]) => {
-    const rows = entries.filter(([, p]) => p.status === status);
+function row(section, ref, p, sub, quote, extra = '') {
+  const label = p.badge ? `<span class="label ${p.badge}">${p.badge === 'new' ? 'NEW' : 'UPDATE'}</span>` : '';
+  const dismissBtn = p.badge ? `<button data-dismiss="${esc(ref)}" data-section="${section}">Dismiss</button>` : '';
+  return `<div class="pr ${p.badge || ''}"><div class="grow">
+      ${label}<a href="${esc(p.url)}" target="_blank">${esc(p.title)}</a>
+      <div class="sub">${sub}</div>${quote || ''}</div>
+      <div class="actions">${dismissBtn}${extra}</div></div>`;
+}
+const quoteOf = l => l ? `<div class="quote"><a href="${esc(l.url)}" target="_blank"><b>${esc(l.author)}</b> · ${ago(l.createdAt)}: “${esc(l.text || '…')}”</a></div>` : '';
+const sortFlagged = entries => entries.sort(([, a], [, b]) => (!!b.badge - !!a.badge) || String(b.latest?.createdAt || '').localeCompare(String(a.latest?.createdAt || '')));
+
+function head(section, blurb) {
+  const n = flagged(section);
+  return `<div class="sechead"><p>${blurb}</p>${n ? `<button data-dismiss-all="${section}">Dismiss all (${n})</button>` : ''}</div>`;
+}
+
+function renderPRs() {
+  const entries = Object.entries(S.prs);
+  let out = head('prs', 'Your open PRs, plus any you track by hand. Flagged rows changed status.');
+  if (!entries.length) return out + '<div class="empty">No PRs tracked yet.</div>';
+  return out + ORDER.map(([status, color]) => {
+    const rows = entries.filter(([, p]) => p.status === status).sort(([, a], [, b]) => !!b.badge - !!a.badge);
     if (!rows.length) return '';
     return `<div class="group"><h2><span class="dot" style="background:${color}"></span>${esc(status)} (${rows.length})</h2>` +
-      rows.map(([ref, p]) => `<div class="pr"><div class="grow">
-        <a href="${esc(p.url)}" target="_blank">${esc(p.title)}</a>
-        <div class="sub">${esc(ref)}${p.detail ? ' · ' + esc(p.detail) : ''} · in this status since ${ago(p.since)}</div></div>
-        ${s.manual.includes(ref) ? `<button class="x" data-ref="${esc(ref)}">Untrack</button>` : ''}</div>`).join('') + '</div>';
+      rows.map(([ref, p]) => row('prs', ref, p,
+        `${esc(ref)}${p.detail ? ' · ' + esc(p.detail) : ''}${p.badge === 'update' && p.changedFrom ? ` · was <i>${esc(p.changedFrom)}</i>` : ''} · since ${ago(p.since)}`,
+        '', S.manual.includes(ref) ? `<button data-untrack="${esc(ref)}">Untrack</button>` : '')).join('') + '</div>';
   }).join('');
 }
 
+function renderMentions() {
+  const entries = sortFlagged(Object.entries(S.mentions));
+  let out = head('mentions', 'Open PRs where someone @-mentioned you in the description or a comment.');
+  if (!entries.length) return out + '<div class="empty">No open PRs mention you.</div>';
+  return out + entries.map(([ref, p]) => row('mentions', ref, p,
+    `${esc(ref)} · by ${esc(p.author)} · ${p.count} mention${p.count === 1 ? '' : 's'}${p.latest ? ` · latest in ${p.latest.where}` : ''}`,
+    quoteOf(p.latest))).join('');
+}
+
+function renderReviewing() {
+  const entries = sortFlagged(Object.entries(S.reviewing)).sort(([, a], [, b]) => (!!b.badge - !!a.badge) || (b.newCount - a.newCount));
+  let out = head('reviewing', 'Open PRs by others that you commented on or reviewed. Shows comments posted since your last one.');
+  if (!entries.length) return out + '<div class="empty">You haven’t commented on any open PRs.</div>';
+  return out + entries.map(([ref, p]) => row('reviewing', ref, p,
+    `${esc(ref)} · by ${esc(p.author)} · ${p.newCount ? `<b>${p.newCount} new since your last comment</b>` : 'no new replies'}${p.myLast ? ` · you last commented ${ago(p.myLast)}` : ''}`,
+    p.newCount ? quoteOf(p.latest) : '')).join('');
+}
+
+function render() {
+  if (!S) return;
+  const total = SECTIONS.reduce((n, [k]) => n + flagged(k), 0);
+  document.title = total ? `(${total}) PR Status Tracker` : 'PR Status Tracker';
+  $('meta').textContent = `Last checked ${ago(S.lastPoll)} · every ${S.pollMinutes} min` + (S.login ? ` · signed in as ${S.login}` : '');
+  $('err').textContent = S.lastError ? `Last poll failed: ${S.lastError}` : '';
+  $('tabs').innerHTML = SECTIONS.map(([k, name]) => {
+    const n = flagged(k);
+    return `<button class="tab ${tab === k ? 'on' : ''}" data-tab="${k}">${name} (${Object.keys(S[k] || {}).length})${n ? `<span class="count">${n}</span>` : ''}</button>`;
+  }).join('');
+  $('list').innerHTML = { prs: renderPRs, mentions: renderMentions, reviewing: renderReviewing }[tab]();
+}
+
+async function load() { S = await (await fetch('/api/state')).json(); render(); }
 const post = (url, data) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data || {}) });
+
 $('add').onclick = async () => {
   const r = await post('/api/add', { pr: $('pr').value });
   const j = await r.json();
   if (!r.ok) { $('err').textContent = j.error; return; }
-  $('pr').value = ''; load();
+  $('pr').value = ''; tab = 'prs'; load();
 };
 $('pr').onkeydown = e => { if (e.key === 'Enter') $('add').click(); };
 $('refresh').onclick = async () => { $('refresh').disabled = true; await post('/api/refresh'); $('refresh').disabled = false; load(); };
 $('test').onclick = () => post('/api/test-notify');
-$('list').onclick = async e => { const ref = e.target.dataset?.ref; if (ref) { await post('/api/remove', { ref }); load(); } };
+$('tabs').onclick = e => { const t = e.target.closest('[data-tab]'); if (t) { tab = t.dataset.tab; try { localStorage.setItem('tab', tab); } catch {} render(); } };
+$('list').onclick = async e => {
+  const d = e.target.dataset || {};
+  if (d.dismiss) await post('/api/dismiss', { section: d.section, ref: d.dismiss });
+  else if (d.dismissAll) await post('/api/dismiss', { section: d.dismissAll });
+  else if (d.untrack) await post('/api/remove', { ref: d.untrack });
+  else return;
+  load();
+};
 load(); setInterval(load, 30000);
 </script>
 </body>

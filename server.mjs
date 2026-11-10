@@ -1,6 +1,9 @@
 #!/usr/bin/env node
-// PR Status Tracker — local tool. Polls GitHub (via the `gh` CLI) every 5 minutes,
-// classifies each PR, and pops up a macOS notification when a status changes.
+// PR Status Tracker — local tool. Polls GitHub (via the `gh` CLI) every 5 minutes and shows:
+//   1. My PRs       — classified into review statuses; pop-up when a status changes
+//   2. Mentioned    — open PRs where someone @-mentioned you (description or comments)
+//   3. Reviewing    — open PRs by others you commented on / reviewed, with replies since your last comment
+// Anything new or changed is flagged NEW / UPDATE in the dashboard until you dismiss it.
 //
 //   node server.mjs            -> http://localhost:4777
 //
@@ -35,11 +38,13 @@ export const STATUS = {
 };
 
 // ---------- state ----------
-// { manual: ["owner/repo#123"], prs: { "owner/repo#123": { status, title, url, detail, since } }, lastPoll, lastError }
-let state = { manual: [], prs: {}, lastPoll: null, lastError: null };
+// prs/mentions/reviewing: { "owner/repo#123": { title, url, badge: 'new'|'update'|null, ... } }
+let state = { manual: [], prs: {}, mentions: {}, reviewing: {}, init: {}, login: null, lastPoll: null, lastError: null };
 if (existsSync(STATE_FILE)) {
   try { state = { ...state, ...JSON.parse(readFileSync(STATE_FILE, 'utf8')) }; } catch {}
 }
+// Existing installs already completed a "my PRs" poll — don't flag them all as new.
+if (state.lastPoll) state.init.prs = true;
 const save = () => writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 
 // ---------- GitHub ----------
@@ -48,6 +53,17 @@ const FRAGMENT = `fragment P on PullRequest {
   repository { nameWithOwner }
   reviews(last: 50) { nodes { body } }
   reviewThreads(first: 100) { nodes { isResolved comments(first: 1) { nodes { body } } } }
+}`;
+
+// Everything written on a PR, for mention / reply detection.
+const ACTIVITY = `fragment A on PullRequest {
+  number title url createdAt
+  repository { nameWithOwner }
+  author { login }
+  body
+  comments(last: 50) { nodes { author { login __typename } body createdAt url } }
+  reviews(last: 30) { nodes { author { login __typename } body createdAt url } }
+  reviewThreads(last: 50) { nodes { comments(last: 20) { nodes { author { login __typename } body createdAt url } } } }
 }`;
 
 function gh(args) {
@@ -65,20 +81,20 @@ async function graphql(query) {
 
 export function parseRef(input) {
   const s = String(input).trim();
-  let m = s.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/) || s.match(/^([^/\s]+)\/([^#\s]+)#(\d+)$/);
+  const m = s.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/) || s.match(/^([^/\s]+)\/([^#\s]+)#(\d+)$/);
   return m ? `${m[1]}/${m[2]}#${m[3]}` : null;
 }
+const refOf = pr => `${pr.repository.nameWithOwner}#${pr.number}`;
+const splitRef = ref => ref.match(/^([^/]+)\/([^#]+)#(\d+)$/).slice(1);
 
-async function fetchPRs() {
+async function fetchMyPRs() {
   const parts = [];
   if (TRACK_MINE) {
-    parts.push(`mine: search(query: "is:pr is:open author:@me archived:false", type: ISSUE, first: 50) {
-      nodes { ...P } }`);
+    parts.push(`mine: search(query: "is:pr is:open author:@me archived:false", type: ISSUE, first: 50) { nodes { ...P } }`);
   }
   state.manual.forEach((ref, i) => {
-    const [, owner, name, num] = ref.match(/^([^/]+)\/([^#]+)#(\d+)$/);
-    parts.push(`m${i}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {
-      pullRequest(number: ${num}) { ...P } }`);
+    const [owner, name, num] = splitRef(ref);
+    parts.push(`m${i}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { pullRequest(number: ${num}) { ...P } }`);
   });
   if (!parts.length) return [];
   const data = await graphql(`query { ${parts.join('\n')} } ${FRAGMENT}`);
@@ -86,6 +102,22 @@ async function fetchPRs() {
   state.manual.forEach((_, i) => { const p = data[`m${i}`]?.pullRequest; if (p) prs.push(p); });
   const seen = new Set();
   return prs.filter(p => p?.number && !seen.has(p.url) && seen.add(p.url));
+}
+
+async function fetchActivity() {
+  const q = s => `search(query: "${s} archived:false", type: ISSUE, first: 30) { nodes { ...A } }`;
+  const data = await graphql(`query {
+    viewer { login }
+    mentioned: ${q('is:pr is:open mentions:@me')}
+    commented: ${q('is:pr is:open commenter:@me -author:@me')}
+    reviewed: ${q('is:pr is:open reviewed-by:@me -author:@me')}
+  } ${ACTIVITY}`);
+  const dedupe = lists => { const m = new Map(); lists.flat().forEach(p => p?.number && m.set(p.url, p)); return [...m.values()]; };
+  return {
+    login: data.viewer.login,
+    mentioned: dedupe([data.mentioned.nodes]),
+    reviewing: dedupe([data.commented.nodes, data.reviewed.nodes]),
+  };
 }
 
 // ---------- classification ----------
@@ -123,24 +155,50 @@ export function classify(pr) {
   return { status: STATUS.READY_AWAITING, detail: blocked || '' };
 }
 
-// ---------- notifications ----------
-function osa(lines, args) {
-  const p = spawn('osascript', [...lines.flatMap(l => ['-e', l]), ...args], { detached: true, stdio: 'ignore' });
-  p.unref();
+// Flatten everything written on a PR (excluding bots) into { login, body, createdAt, url }.
+function items(pr) {
+  const out = [];
+  if (pr.author) out.push({ login: pr.author.login, body: pr.body || '', createdAt: pr.createdAt, url: pr.url, isDescription: true });
+  const add = n => { if (n?.author && n.author.__typename !== 'Bot' && !/\[bot\]$/.test(n.author.login)) out.push({ login: n.author.login, body: n.body || '', createdAt: n.createdAt, url: n.url }); };
+  (pr.comments?.nodes || []).forEach(add);
+  (pr.reviews?.nodes || []).filter(r => r.body?.trim()).forEach(add);
+  (pr.reviewThreads?.nodes || []).forEach(t => (t.comments?.nodes || []).forEach(add));
+  return out.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+const snippet = s => s.replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().slice(0, 160);
+const lc = s => s.toLowerCase();
+
+export function mentionInfo(pr, login) {
+  const re = new RegExp(`@${login.replace(/[-]/g, '\\-')}(?![\\w-])`, 'i');
+  const hits = items(pr).filter(i => lc(i.login) !== lc(login) && re.test(i.body));
+  const last = hits.at(-1);
+  return { count: hits.length, latest: last && { author: last.login, text: snippet(last.body), url: last.url, createdAt: last.createdAt, where: last.isDescription ? 'description' : 'comment' } };
 }
 
-function notify(changes) {
-  if (!changes.length) return;
-  const one = changes.length === 1 ? changes[0] : null;
-  const title = one ? `${one.ref} → ${one.to}` : `${changes.length} PRs changed status`;
-  const msg = one
-    ? `${one.title}\n\nWas: ${one.from}`
-    : changes.map(c => `• ${c.ref}: ${c.to}`).join('\n');
+export function replyInfo(pr, login) {
+  const all = items(pr).filter(i => !i.isDescription);
+  const mine = all.filter(i => lc(i.login) === lc(login));
+  const myLast = mine.at(-1)?.createdAt || '';
+  const after = all.filter(i => lc(i.login) !== lc(login) && i.createdAt > myLast);
+  const last = after.at(-1);
+  return { newCount: after.length, myLast, latest: last && { author: last.login, text: snippet(last.body), url: last.url, createdAt: last.createdAt } };
+}
+
+// ---------- notifications ----------
+function osa(lines, args) {
+  spawn('osascript', [...lines.flatMap(l => ['-e', l]), ...args], { detached: true, stdio: 'ignore' }).unref();
+}
+
+// events: [{ ref, title, url, headline, detail }]
+function notify(events) {
+  if (!events.length) return;
+  const one = events.length === 1 ? events[0] : null;
+  const title = one ? `${one.ref}: ${one.headline}` : `${events.length} PR updates`;
+  const msg = one ? `${one.title}${one.detail ? `\n\n${one.detail}` : ''}` : events.map(e => `• ${e.ref}: ${e.headline}`).join('\n');
   const openUrl = one ? one.url : `http://localhost:${PORT}`;
 
   if (NOTIFY === 'banner') {
-    osa(['on run argv', 'display notification (item 1 of argv) with title "PR Status" subtitle (item 2 of argv) sound name "Glass"', 'end run'],
-      [msg, title]);
+    osa(['on run argv', 'display notification (item 1 of argv) with title "PR Status" subtitle (item 2 of argv) sound name "Glass"', 'end run'], [msg, title]);
     return;
   }
   osa([
@@ -153,58 +211,121 @@ function notify(changes) {
 }
 
 // ---------- poll loop ----------
+async function pollMyPRs(events) {
+  const prs = await fetchMyPRs();
+  const live = new Set();
+  const flag = state.init.prs; // first-ever poll establishes a baseline without flags
+  let pending = false;
+  for (const pr of prs) {
+    const ref = refOf(pr);
+    live.add(ref);
+    const prev = state.prs[ref];
+    const { status, detail } = classify(pr);
+    if (!status && !prev) { pending = true; continue; } // mergeability not computed yet — retry shortly
+    if (!status) pending = true;
+    const next = status || prev.status;
+    let badge = prev?.badge || null;
+    if (prev && prev.status !== next) {
+      badge = 'update';
+      events.push({ ref, title: pr.title, url: pr.url, headline: next, detail: `Was: ${prev.status}` });
+    } else if (!prev && flag) badge = 'new';
+    state.prs[ref] = { status: next, detail, title: pr.title, url: pr.url, badge,
+      since: prev && prev.status === next ? prev.since : new Date().toISOString(),
+      changedFrom: prev && prev.status !== next ? prev.status : prev?.changedFrom };
+  }
+  // Auto-tracked PRs that left the open search (merged/closed): look up the final state once,
+  // keep them flagged until dismissed, then they drop off.
+  for (const [ref, prev] of Object.entries(state.prs)) {
+    if (live.has(ref) || state.manual.includes(ref) || prev.gone) continue;
+    const [owner, name, num] = splitRef(ref);
+    let status = STATUS.CLOSED;
+    try {
+      const d = await graphql(`query { repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { pullRequest(number: ${num}) { ...P } } } ${FRAGMENT}`);
+      const pr = d.repository?.pullRequest;
+      if (pr) status = classify(pr).status;
+    } catch {}
+    if (status === STATUS.MERGED || status === STATUS.CLOSED) {
+      events.push({ ref, title: prev.title, url: prev.url, headline: status, detail: `Was: ${prev.status}` });
+      state.prs[ref] = { ...prev, status, detail: '', badge: 'update', gone: true, changedFrom: prev.status, since: new Date().toISOString() };
+    }
+  }
+  state.init.prs = true;
+  return pending;
+}
+
+function pollMentions(list, events) {
+  const flag = state.init.mentions;
+  const next = {};
+  for (const pr of list) {
+    const ref = refOf(pr);
+    const prev = state.mentions[ref];
+    const info = mentionInfo(pr, state.login);
+    let badge = prev?.badge || null;
+    if (!prev && flag) badge = 'new';
+    else if (prev && info.count > prev.count) badge = 'update';
+    if (flag && (!prev || info.count > prev.count) && info.latest) {
+      events.push({ ref, title: pr.title, url: info.latest.url, headline: `${info.latest.author} mentioned you`, detail: info.latest.text });
+    }
+    next[ref] = { title: pr.title, url: pr.url, author: pr.author?.login, ...info, badge };
+  }
+  state.mentions = next;
+  state.init.mentions = true;
+}
+
+function pollReviewing(list, events) {
+  const flag = state.init.reviewing;
+  const next = {};
+  for (const pr of list) {
+    const ref = refOf(pr);
+    const prev = state.reviewing[ref];
+    const info = replyInfo(pr, state.login);
+    let badge = prev?.badge || null;
+    // New replies = more comments after your last one than last time (resets when you reply).
+    const grew = prev && info.newCount > 0 && (info.myLast !== prev.myLast ? false : info.newCount > prev.newCount);
+    if (grew || (!prev && flag && info.newCount > 0)) {
+      badge = 'update';
+      events.push({ ref, title: pr.title, url: info.latest.url, headline: `${info.latest.author} replied`, detail: info.latest.text });
+    }
+    next[ref] = { title: pr.title, url: pr.url, author: pr.author?.login, ...info, badge };
+  }
+  state.reviewing = next;
+  state.init.reviewing = true;
+}
+
 let polling = null;
 async function poll() {
   if (polling) return polling;
   polling = (async () => {
+    const events = [];
+    const errors = [];
+    let pending = false;
+    try { pending = await pollMyPRs(events); } catch (e) { errors.push(`my PRs: ${e.message}`); }
     try {
-      const prs = await fetchPRs();
-      const changes = [];
-      const live = new Set();
-      let pending = false;
-      for (const pr of prs) {
-        const ref = `${pr.repository.nameWithOwner}#${pr.number}`;
-        live.add(ref);
-        const prev = state.prs[ref];
-        const { status, detail } = classify(pr);
-        if (!status && !prev) { pending = true; continue; } // mergeability not computed yet — retry shortly
-        if (!status) pending = true;
-        const next = status || prev.status;
-        if (prev && prev.status !== next) changes.push({ ref, title: pr.title, url: pr.url, from: prev.status, to: next });
-        state.prs[ref] = { status: next, detail, title: pr.title, url: pr.url,
-          since: prev && prev.status === next ? prev.since : new Date().toISOString() };
-      }
-      // PRs that left the "my open PRs" search (merged/closed) — look them up once to report the final state.
-      for (const ref of Object.keys(state.prs)) {
-        if (live.has(ref)) continue;
-        if (!state.manual.includes(ref)) {
-          const [, owner, name, num] = ref.match(/^([^/]+)\/([^#]+)#(\d+)$/);
-          try {
-            const d = await graphql(`query { repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { pullRequest(number: ${num}) { ...P } } } ${FRAGMENT}`);
-            const pr = d.repository?.pullRequest;
-            const { status } = pr ? classify(pr) : { status: STATUS.CLOSED };
-            const prev = state.prs[ref];
-            if (status && status !== prev.status && (status === STATUS.MERGED || status === STATUS.CLOSED)) {
-              changes.push({ ref, title: prev.title, url: prev.url, from: prev.status, to: status });
-            }
-          } catch {}
-          delete state.prs[ref];
-        }
-      }
-      state.lastPoll = new Date().toISOString();
-      state.lastError = null;
-      notify(changes);
-      if (pending) setTimeout(poll, 30_000);
-      if (changes.length) console.log(new Date().toISOString(), changes.map(c => `${c.ref}: ${c.from} -> ${c.to}`).join(' | '));
-    } catch (e) {
-      state.lastError = e.message;
-      console.error('poll failed:', e.message);
-    } finally {
-      save();
-      polling = null;
-    }
+      const act = await fetchActivity();
+      state.login = act.login;
+      pollMentions(act.mentioned, events);
+      pollReviewing(act.reviewing, events);
+    } catch (e) { errors.push(`mentions/reviews: ${e.message}`); }
+    state.lastPoll = new Date().toISOString();
+    state.lastError = errors.join(' · ') || null;
+    if (errors.length) console.error('poll failed:', state.lastError);
+    if (events.length) console.log(state.lastPoll, events.map(e => `${e.ref}: ${e.headline}`).join(' | '));
+    notify(events);
+    if (pending) setTimeout(poll, 30_000);
+    save();
+    polling = null;
   })();
   return polling;
+}
+
+function dismiss(section, ref) {
+  const bucket = state[section];
+  if (!bucket) return;
+  for (const r of ref ? [ref] : Object.keys(bucket)) {
+    if (!bucket[r]) continue;
+    if (bucket[r].gone) delete bucket[r];
+    else bucket[r].badge = null;
+  }
 }
 
 // ---------- HTTP ----------
@@ -215,7 +336,7 @@ const json = (res, code, obj) => { res.writeHead(code, { 'content-type': 'applic
 http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/') { res.writeHead(200, { 'content-type': 'text/html' }); return res.end(html); }
   if (req.method === 'GET' && req.url === '/api/state') {
-    return json(res, 200, { ...state, pollMinutes: POLL_MS / 60_000, trackMine: TRACK_MINE, nextPoll: state.lastPoll ? new Date(Date.parse(state.lastPoll) + POLL_MS).toISOString() : null });
+    return json(res, 200, { ...state, pollMinutes: POLL_MS / 60_000, trackMine: TRACK_MINE });
   }
   if (req.method === 'POST' && req.url === '/api/refresh') { await poll(); return json(res, 200, { ok: true }); }
   if (req.method === 'POST' && req.url === '/api/add') {
@@ -232,8 +353,14 @@ http.createServer(async (req, res) => {
     save();
     return json(res, 200, { ok: true });
   }
+  if (req.method === 'POST' && req.url === '/api/dismiss') {
+    const { section, ref } = await body(req); // ref omitted = dismiss all in section; section omitted = everything
+    for (const s of section ? [section] : ['prs', 'mentions', 'reviewing']) dismiss(s, ref);
+    save();
+    return json(res, 200, { ok: true });
+  }
   if (req.method === 'POST' && req.url === '/api/test-notify') {
-    notify([{ ref: 'test/repo#1', title: 'Test notification', url: `http://localhost:${PORT}`, from: STATUS.DRAFT_NO_AR, to: STATUS.DRAFT_READY }]);
+    notify([{ ref: 'test/repo#1', title: 'Test notification', url: `http://localhost:${PORT}`, headline: STATUS.DRAFT_READY, detail: `Was: ${STATUS.DRAFT_NO_AR}` }]);
     return json(res, 200, { ok: true });
   }
   res.writeHead(404); res.end();
