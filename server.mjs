@@ -14,6 +14,7 @@
 //   POLL_MINUTES=5             poll interval
 //   NOTIFY=alert|banner        alert = dialog that stays until dismissed (default); banner = Notification Center
 //   TRACK_MINE=1|0             auto-track every open PR you authored (default 1)
+//   VOLUME=4                   ding loudness (1 = normal system level; higher is louder)
 
 import http from 'node:http';
 import { execFile, spawn } from 'node:child_process';
@@ -27,6 +28,7 @@ const PORT = Number(process.env.PORT || 4777);
 const POLL_MS = Number(process.env.POLL_MINUTES || 5) * 60_000;
 const NOTIFY = process.env.NOTIFY || 'alert';
 const TRACK_MINE = process.env.TRACK_MINE !== '0';
+const VOLUME = String(process.env.VOLUME || 4);
 
 export const STATUS = {
   DRAFT_NO_AR: 'Draft — no adversarial review',
@@ -304,8 +306,8 @@ function notify(events) {
   const openUrl = one ? one.url : `http://localhost:${PORT}`;
 
   if (NOTIFY === 'banner') {
-    osa(['on run argv', 'display notification (item 1 of argv) with title "PR Status" subtitle (item 2 of argv) sound name "Glass"', 'end run'], [msg, title]);
-    return;
+    osa(['on run argv', 'display notification (item 1 of argv) with title "PR Status" subtitle (item 2 of argv)', 'end run'], [msg, title]);
+    return ding();
   }
   osa([
     'on run argv',
@@ -313,7 +315,12 @@ function notify(events) {
     'if button returned of r is "Open" then open location (item 3 of argv)',
     'end run',
   ], [msg, title, openUrl]);
-  spawn('afplay', ['/System/Library/Sounds/Glass.aiff'], { detached: true, stdio: 'ignore' }).unref();
+  ding();
+}
+
+// Louder than the stock notification sound: afplay's -v scales the volume (1 = normal).
+function ding() {
+  spawn('afplay', ['-v', VOLUME, '/System/Library/Sounds/Glass.aiff'], { detached: true, stdio: 'ignore' }).unref();
 }
 
 // ---------- poll loop ----------

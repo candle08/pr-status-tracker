@@ -21,7 +21,7 @@ Tracks every open PR you authored, plus any PR you add on the dashboard.
 High-risk highlights are left out of the counts because nobody ever resolves them.
 
 ## Options (env vars)
-`NOTIFY=banner` uses a Notification Center banner instead of the default dialog · `POLL_MINUTES=5` · `PORT=4777` · `TRACK_MINE=0` tracks only PRs you add.
+`VOLUME=4` sets how loud the ding is (1 = normal) · `NOTIFY=banner` uses a Notification Center banner instead of the default dialog · `POLL_MINUTES=5` · `PORT=4777` · `TRACK_MINE=0` tracks only PRs you add.
 
 ## Sections
 - **My PRs** grouped by status above. **Mentioned**: open PRs where someone @-mentioned you. **Reviewing**: open PRs by others you commented on or reviewed, with comments posted since your last one.

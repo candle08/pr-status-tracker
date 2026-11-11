@@ -32,7 +32,12 @@
   details.depri-group summary::before { content:'▸'; }
   details.depri-group[open] summary::before { content:'▾'; }
   .dot { width:10px; height:10px; border-radius:50%; display:inline-block; flex:none; }
-  .pr { background:var(--card); border:1px solid var(--border); border-left:4px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:8px; }
+  .pr { background:var(--card); border:1px solid var(--border); border-left:4px solid var(--border); border-radius:8px; padding:7px 12px; margin-bottom:5px; }
+  .toggle { border:none; background:none; padding:2px 0 0; font-size:12px; color:var(--muted); cursor:pointer; }
+  .toggle:hover { color:var(--accent); }
+  .toggle .arrow { display:inline-block; width:10px; }
+  .toggle .tag { font-size:10px; font-weight:700; color:#fff; background:var(--upd); border-radius:8px; padding:0 5px; }
+  .pr.new .toggle .tag { background:var(--new); }
   .pr.new { border-left-color:var(--new); background:var(--new-bg); }
   .pr.update { border-left-color:var(--upd); background:var(--upd-bg); }
   .pr.depri { opacity:.7; }
@@ -102,10 +107,23 @@ const ago = iso => { if (!iso) return 'never'; const m = Math.round((Date.now() 
 const isDepri = ref => (S.deprioritised || []).includes(ref);
 const flagged = sec => Object.entries(S?.[sec] || {}).filter(([ref, p]) => p.badge && !isDepri(ref)).length;
 
-function stepsBlock(p, depri) {
-  if (depri || !p.steps?.length) return '';
+// Collapsed by default so more PRs fit on screen; open/closed is remembered per PR.
+let openSteps = new Set();
+try { openSteps = new Set(JSON.parse(localStorage.getItem('openSteps') || '[]')); } catch {}
+const stepKey = (section, ref) => `${section}|${ref}`;
+
+function stepsToggle(section, ref, p, depri) {
+  if (!p.steps?.length) return '';
+  const open = openSteps.has(stepKey(section, ref));
+  const nNew = depri ? 0 : (p.newSteps || []).length;
+  return `<button class="toggle" data-steps="${esc(stepKey(section, ref))}" aria-expanded="${open}">
+    <span class="arrow">${open ? '▾' : '▸'}</span> Next steps (${p.steps.length})${nNew ? ` <span class="tag">${nNew} NEW</span>` : ''}</button>`;
+}
+
+function stepsBlock(section, ref, p) {
+  if (!p.steps?.length || !openSteps.has(stepKey(section, ref))) return '';
   const fresh = new Set(p.newSteps || []);
-  return `<div class="steps"><h3>Next steps</h3><ol>${p.steps.map(s => {
+  return `<div class="steps"><ol>${p.steps.map(s => {
     const isNew = fresh.has(s.id);
     const text = s.url ? `<a href="${esc(s.url)}" target="_blank">${esc(s.text)}</a>` : esc(s.text);
     return `<li class="${isNew ? 'fresh' : ''}">${isNew ? '<span class="tag">NEW</span>' : ''}${text}</li>`;
@@ -121,8 +139,8 @@ function row(section, ref, p, sub, extra = '') {
     + `<button data-depri="${esc(ref)}" data-on="${depri ? '0' : '1'}">${depri ? 'Reprioritise' : 'Deprioritise'}</button>` + extra;
   return `<div class="pr ${badge || ''} ${depri ? 'depri' : ''}"><div class="top"><div class="grow">
       ${labels}<a href="${esc(p.url)}" target="_blank">${esc(p.title)}</a>
-      <div class="sub">${sub}</div></div>
-      <div class="actions">${btns}</div></div>${stepsBlock(p, depri)}</div>`;
+      <div class="sub">${sub}</div>${stepsToggle(section, ref, p, depri)}</div>
+      <div class="actions">${btns}</div></div>${stepsBlock(section, ref, p)}</div>`;
 }
 
 function head(section, blurb) {
@@ -206,6 +224,13 @@ $('refresh').onclick = async () => { $('refresh').disabled = true; await post('/
 $('test').onclick = () => post('/api/test-notify');
 $('tabs').onclick = e => { const t = e.target.closest('[data-tab]'); if (t) { tab = t.dataset.tab; try { localStorage.setItem('tab', tab); } catch {} render(); } };
 $('list').onclick = async e => {
+  const t = e.target.closest('[data-steps]');
+  if (t) {
+    const k = t.dataset.steps;
+    openSteps.has(k) ? openSteps.delete(k) : openSteps.add(k);
+    try { localStorage.setItem('openSteps', JSON.stringify([...openSteps])); } catch {}
+    return render();
+  }
   const d = e.target.dataset || {};
   if (d.dismiss) await post('/api/dismiss', { section: d.section, ref: d.dismiss });
   else if (d.dismissAll) await post('/api/dismiss', { section: d.dismissAll });
