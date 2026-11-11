@@ -3,7 +3,9 @@
 //   1. My PRs       — classified into review statuses; pop-up when a status changes
 //   2. Mentioned    — open PRs where someone @-mentioned you (description or comments)
 //   3. Reviewing    — open PRs by others you commented on / reviewed, with replies since your last comment
-// Anything new or changed is flagged NEW / UPDATE in the dashboard until you dismiss it.
+// Every PR gets auto-generated "next steps". Anything new or changed is flagged NEW / UPDATE
+// (and its new next steps highlighted) until you dismiss it. PRs you mark deprioritised sink
+// to the bottom and stop popping up.
 //
 //   node server.mjs            -> http://localhost:4777
 //
@@ -38,8 +40,9 @@ export const STATUS = {
 };
 
 // ---------- state ----------
-// prs/mentions/reviewing: { "owner/repo#123": { title, url, badge: 'new'|'update'|null, ... } }
-let state = { manual: [], prs: {}, mentions: {}, reviewing: {}, init: {}, login: null, lastPoll: null, lastError: null };
+// prs/mentions/reviewing: { "owner/repo#123": { title, url, badge: 'new'|'update'|null, steps: [{id,text,url}], newSteps: [id], ... } }
+// deprioritised: ["owner/repo#123"] — applies in every section
+let state = { manual: [], deprioritised: [], prs: {}, mentions: {}, reviewing: {}, init: {}, login: null, lastPoll: null, lastError: null };
 if (existsSync(STATE_FILE)) {
   try { state = { ...state, ...JSON.parse(readFileSync(STATE_FILE, 'utf8')) }; } catch {}
 }
@@ -52,7 +55,11 @@ const FRAGMENT = `fragment P on PullRequest {
   number title url isDraft state mergeable mergeStateStatus reviewDecision
   repository { nameWithOwner }
   reviews(last: 50) { nodes { body } }
-  reviewThreads(first: 100) { nodes { isResolved comments(first: 1) { nodes { body } } } }
+  latestReviews(first: 20) { nodes { author { login } state } }
+  reviewRequests(first: 10) { nodes { requestedReviewer { __typename ... on User { login } ... on Team { name } } } }
+  commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes {
+    __typename ... on CheckRun { name conclusion status detailsUrl } ... on StatusContext { context state targetUrl } } } } } } }
+  reviewThreads(first: 100) { nodes { isResolved path comments(first: 1) { nodes { body url author { login } } } } }
 }`;
 
 // Everything written on a PR, for mention / reply detection.
@@ -61,6 +68,7 @@ const ACTIVITY = `fragment A on PullRequest {
   repository { nameWithOwner }
   author { login }
   body
+  reviewRequests(first: 10) { nodes { requestedReviewer { __typename ... on User { login } } } }
   comments(last: 50) { nodes { author { login __typename } body createdAt url } }
   reviews(last: 30) { nodes { author { login __typename } body createdAt url } }
   reviewThreads(last: 50) { nodes { comments(last: 20) { nodes { author { login __typename } body createdAt url } } } }
@@ -123,17 +131,19 @@ async function fetchActivity() {
 // ---------- classification ----------
 const AR_SUMMARY = /Automated adversarial review/i;
 const AR_FINDING = /^!\[Adversarial Review: (High|Medium|Low)\]/; // excludes High Risk highlights + replies
+const firstComment = t => t.comments?.nodes?.[0] || {};
+const openThreads = pr => (pr.reviewThreads?.nodes || [])
+  .filter(t => !t.isResolved && !/Adversarial Review: High Risk/.test(firstComment(t).body || ''));
 
 export function classify(pr) {
   if (pr.state === 'MERGED') return { status: STATUS.MERGED, detail: '' };
   if (pr.state === 'CLOSED') return { status: STATUS.CLOSED, detail: '' };
 
   const threads = pr.reviewThreads?.nodes || [];
-  const firstBody = t => t.comments?.nodes?.[0]?.body || '';
-  const openAll = threads.filter(t => !t.isResolved && !/Adversarial Review: High Risk/.test(firstBody(t)));
-  const openAR = openAll.filter(t => AR_FINDING.test(firstBody(t)));
+  const openAll = openThreads(pr);
+  const openAR = openAll.filter(t => AR_FINDING.test(firstComment(t).body || ''));
   const hasAR = (pr.reviews?.nodes || []).some(r => AR_SUMMARY.test(r.body || ''))
-    || threads.some(t => AR_FINDING.test(firstBody(t)));
+    || threads.some(t => AR_FINDING.test(firstComment(t).body || ''));
 
   if (pr.isDraft) {
     if (!hasAR) return { status: STATUS.DRAFT_NO_AR, detail: '' };
@@ -155,6 +165,80 @@ export function classify(pr) {
   return { status: STATUS.READY_AWAITING, detail: blocked || '' };
 }
 
+const snippet = (s, n = 140) => String(s || '').replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/<[^>]+>/g, '')
+  .replace(/[*_`#>]/g, '').replace(/\s+/g, ' ').trim().slice(0, n);
+
+// Checks on the head commit. A check name counts as failing/pending only if no run of it succeeded (reruns).
+function checks(pr) {
+  const roll = pr.commits?.nodes?.[0]?.commit?.statusCheckRollup;
+  if (!roll) return { failing: [], pending: [] };
+  const runs = (roll.contexts?.nodes || []).map(c => c.__typename === 'CheckRun'
+    ? { name: c.name, url: c.detailsUrl, ok: ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(c.conclusion), bad: ['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE'].includes(c.conclusion), wait: c.status !== 'COMPLETED' }
+    : { name: c.context, url: c.targetUrl, ok: c.state === 'SUCCESS', bad: ['FAILURE', 'ERROR'].includes(c.state), wait: ['PENDING', 'EXPECTED'].includes(c.state) });
+  const okNames = new Set(runs.filter(r => r.ok).map(r => r.name));
+  const uniq = list => [...new Map(list.filter(r => !okNames.has(r.name)).map(r => [r.name, r])).values()];
+  return { failing: uniq(runs.filter(r => r.bad)), pending: uniq(runs.filter(r => r.wait)) };
+}
+
+// Concrete to-do list for one of your PRs. Step ids are stable so we can tell which steps are new.
+export function nextStepsForMine(pr, status) {
+  if (status === STATUS.MERGED) return [{ id: 'done', text: 'Merged — nothing left to do. Dismiss to clear it.' }];
+  if (status === STATUS.CLOSED) return [{ id: 'done', text: 'Closed — nothing left to do. Dismiss to clear it.' }];
+  const steps = [];
+  const { failing, pending } = checks(pr);
+  const threads = openThreads(pr);
+  const arThreads = threads.filter(t => AR_FINDING.test(firstComment(t).body || ''));
+  const humanThreads = threads.filter(t => !AR_FINDING.test(firstComment(t).body || ''));
+  const threadStep = (t, verb) => {
+    const c = firstComment(t);
+    const sev = (c.body || '').match(AR_FINDING)?.[1];
+    return { id: `thread:${c.url}`, url: c.url,
+      text: sev ? `${verb} ${sev} finding${t.path ? ` in ${t.path}` : ''}: ${snippet(c.body)}`
+                : `${verb} ${c.author?.login || 'reviewer'}${t.path ? ` on ${t.path}` : ''}: ${snippet(c.body)}` };
+  };
+  const capped = (list, verb) => {
+    const out = list.slice(0, 8).map(t => threadStep(t, verb));
+    if (list.length > 8) out.push({ id: `more:${verb}`, text: `…and ${list.length - 8} more`, url: pr.url + '/files' });
+    return out;
+  };
+
+  if (pr.mergeable === 'CONFLICTING') steps.push({ id: 'conflicts', text: 'Resolve merge conflicts with the base branch', url: pr.url });
+  else if (pr.mergeStateStatus === 'BEHIND') steps.push({ id: 'behind', text: 'Update the branch with the base branch', url: pr.url });
+  failing.forEach(c => steps.push({ id: `check:${c.name}`, text: `Fix failing check: ${c.name}`, url: c.url }));
+
+  switch (status) {
+    case STATUS.DRAFT_NO_AR:
+      steps.push({ id: 'run-ar', text: 'Run the adversarial review (/adversarial-review-scale)', url: pr.url });
+      break;
+    case STATUS.DRAFT_AR_COMMENTS:
+      steps.push(...capped(arThreads, 'Address'));
+      break;
+    case STATUS.DRAFT_READY:
+      if (humanThreads.length) steps.push(...capped(humanThreads, 'Reply to'));
+      if (!failing.length) steps.push({ id: 'mark-ready', text: 'Mark the PR ready for review', url: pr.url });
+      break;
+    case STATUS.READY_COMMENTS:
+    case STATUS.READY_AWAITING: {
+      (pr.latestReviews?.nodes || []).filter(r => r.state === 'CHANGES_REQUESTED').forEach(r =>
+        steps.push({ id: `cr:${r.author?.login}`, text: `Address changes requested by ${r.author?.login}, then re-request their review`, url: pr.url }));
+      steps.push(...capped(arThreads, 'Address'), ...capped(humanThreads, 'Reply to / resolve'));
+      if (status === STATUS.READY_AWAITING) {
+        const requested = (pr.reviewRequests?.nodes || []).map(r => r.requestedReviewer?.login || r.requestedReviewer?.name).filter(Boolean);
+        const approved = (pr.latestReviews?.nodes || []).some(r => r.state === 'APPROVED');
+        if (pending.length) steps.push({ id: 'pending-checks', text: `Wait for checks to finish: ${pending.map(c => c.name).slice(0, 5).join(', ')}`, url: pr.url + '/checks' });
+        if (requested.length) steps.push({ id: `waiting:${requested.sort().join(',')}`, text: `Waiting on review from ${requested.join(', ')} — nudge if it's been a while`, url: pr.url });
+        else if (!approved) steps.push({ id: 'request-review', text: 'Request a reviewer', url: pr.url });
+      }
+      break;
+    }
+    case STATUS.MERGEABLE:
+      steps.push({ id: 'merge', text: 'Merge the PR', url: pr.url });
+      break;
+  }
+  if (!steps.length) steps.push({ id: 'none', text: 'Nothing to do right now — waiting on GitHub', url: pr.url });
+  return steps;
+}
+
 // Flatten everything written on a PR (excluding bots) into { login, body, createdAt, url }.
 function items(pr) {
   const out = [];
@@ -165,23 +249,44 @@ function items(pr) {
   (pr.reviewThreads?.nodes || []).forEach(t => (t.comments?.nodes || []).forEach(add));
   return out.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
-const snippet = s => s.replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().slice(0, 160);
 const lc = s => s.toLowerCase();
 
 export function mentionInfo(pr, login) {
-  const re = new RegExp(`@${login.replace(/[-]/g, '\\-')}(?![\\w-])`, 'i');
+  const re = new RegExp(`@${login}(?![\\w-])`, 'i');
   const hits = items(pr).filter(i => lc(i.login) !== lc(login) && re.test(i.body));
   const last = hits.at(-1);
-  return { count: hits.length, latest: last && { author: last.login, text: snippet(last.body), url: last.url, createdAt: last.createdAt, where: last.isDescription ? 'description' : 'comment' } };
+  // Mentions you haven't answered = mentions after your last comment on the PR.
+  const myLast = items(pr).filter(i => !i.isDescription && lc(i.login) === lc(login)).at(-1)?.createdAt || '';
+  const unanswered = hits.filter(h => h.createdAt > myLast);
+  const steps = unanswered.slice(-5).map(h => ({ id: `mention:${h.url}`, url: h.url,
+    text: `Respond to ${h.login}'s mention${h.isDescription ? ' in the description' : ''}: ${snippet(h.body)}` }));
+  if (!steps.length) steps.push({ id: 'none', text: 'You’ve replied since the last mention — nothing to do', url: pr.url });
+  return { count: hits.length, steps,
+    latest: last && { author: last.login, text: snippet(last.body, 160), url: last.url, createdAt: last.createdAt, where: last.isDescription ? 'description' : 'comment' } };
 }
 
 export function replyInfo(pr, login) {
   const all = items(pr).filter(i => !i.isDescription);
-  const mine = all.filter(i => lc(i.login) === lc(login));
-  const myLast = mine.at(-1)?.createdAt || '';
+  const myLast = all.filter(i => lc(i.login) === lc(login)).at(-1)?.createdAt || '';
   const after = all.filter(i => lc(i.login) !== lc(login) && i.createdAt > myLast);
   const last = after.at(-1);
-  return { newCount: after.length, myLast, latest: last && { author: last.login, text: snippet(last.body), url: last.url, createdAt: last.createdAt } };
+  const reRequested = (pr.reviewRequests?.nodes || []).some(r => lc(r.requestedReviewer?.login || '') === lc(login));
+  const steps = [];
+  if (reRequested) steps.push({ id: 'review-requested', text: 'Your review is requested — review the latest changes', url: pr.url + '/files' });
+  after.slice(-5).forEach(a => steps.push({ id: `reply:${a.url}`, url: a.url, text: `Read & respond to ${a.login}: ${snippet(a.body)}` }));
+  if (!steps.length) steps.push({ id: 'none', text: 'Nothing new — waiting on the author', url: pr.url });
+  return { newCount: after.length, myLast, steps,
+    latest: last && { author: last.login, text: snippet(last.body, 160), url: last.url, createdAt: last.createdAt } };
+}
+
+// Carry forward "new step" highlights until dismissed; mark steps that weren't there last poll.
+function diffSteps(prev, steps, flag) {
+  const prevIds = new Set((prev?.steps || []).map(s => s.id));
+  const ids = new Set(steps.map(s => s.id));
+  // prev without steps = state from before next steps existed; treat as a baseline, not a change.
+  const fresh = prev?.steps && flag ? steps.filter(s => !prevIds.has(s.id) && s.id !== 'none').map(s => s.id) : [];
+  const carried = (prev?.newSteps || []).filter(id => ids.has(id));
+  return { newSteps: [...new Set([...carried, ...fresh])], changed: fresh.length > 0 };
 }
 
 // ---------- notifications ----------
@@ -191,6 +296,7 @@ function osa(lines, args) {
 
 // events: [{ ref, title, url, headline, detail }]
 function notify(events) {
+  events = events.filter(e => !state.deprioritised.includes(e.ref));
   if (!events.length) return;
   const one = events.length === 1 ? events[0] : null;
   const title = one ? `${one.ref}: ${one.headline}` : `${events.length} PR updates`;
@@ -224,12 +330,15 @@ async function pollMyPRs(events) {
     if (!status && !prev) { pending = true; continue; } // mergeability not computed yet — retry shortly
     if (!status) pending = true;
     const next = status || prev.status;
+    const steps = nextStepsForMine(pr, next);
+    const { newSteps, changed } = diffSteps(prev, steps, flag);
     let badge = prev?.badge || null;
     if (prev && prev.status !== next) {
       badge = 'update';
-      events.push({ ref, title: pr.title, url: pr.url, headline: next, detail: `Was: ${prev.status}` });
+      events.push({ ref, title: pr.title, url: pr.url, headline: next, detail: `Was: ${prev.status}\n\nNext: ${steps[0].text}` });
     } else if (!prev && flag) badge = 'new';
-    state.prs[ref] = { status: next, detail, title: pr.title, url: pr.url, badge,
+    else if (changed && !badge) badge = 'update'; // e.g. a new review comment or failing check — UI flag only
+    state.prs[ref] = { status: next, detail, title: pr.title, url: pr.url, badge, steps, newSteps,
       since: prev && prev.status === next ? prev.since : new Date().toISOString(),
       changedFrom: prev && prev.status !== next ? prev.status : prev?.changedFrom };
   }
@@ -245,8 +354,10 @@ async function pollMyPRs(events) {
       if (pr) status = classify(pr).status;
     } catch {}
     if (status === STATUS.MERGED || status === STATUS.CLOSED) {
+      const steps = nextStepsForMine(null, status);
       events.push({ ref, title: prev.title, url: prev.url, headline: status, detail: `Was: ${prev.status}` });
-      state.prs[ref] = { ...prev, status, detail: '', badge: 'update', gone: true, changedFrom: prev.status, since: new Date().toISOString() };
+      state.prs[ref] = { ...prev, status, detail: '', badge: 'update', gone: true, steps, newSteps: steps.map(s => s.id),
+        changedFrom: prev.status, since: new Date().toISOString() };
     }
   }
   state.init.prs = true;
@@ -260,13 +371,15 @@ function pollMentions(list, events) {
     const ref = refOf(pr);
     const prev = state.mentions[ref];
     const info = mentionInfo(pr, state.login);
+    const { newSteps } = diffSteps(prev, info.steps, flag);
     let badge = prev?.badge || null;
     if (!prev && flag) badge = 'new';
     else if (prev && info.count > prev.count) badge = 'update';
     if (flag && (!prev || info.count > prev.count) && info.latest) {
       events.push({ ref, title: pr.title, url: info.latest.url, headline: `${info.latest.author} mentioned you`, detail: info.latest.text });
     }
-    next[ref] = { title: pr.title, url: pr.url, author: pr.author?.login, ...info, badge };
+    next[ref] = { title: pr.title, url: pr.url, author: pr.author?.login, ...info, badge,
+      newSteps: !prev && flag ? info.steps.filter(s => s.id !== 'none').map(s => s.id) : newSteps };
   }
   state.mentions = next;
   state.init.mentions = true;
@@ -279,14 +392,15 @@ function pollReviewing(list, events) {
     const ref = refOf(pr);
     const prev = state.reviewing[ref];
     const info = replyInfo(pr, state.login);
+    const { newSteps, changed } = diffSteps(prev, info.steps, flag);
     let badge = prev?.badge || null;
     // New replies = more comments after your last one than last time (resets when you reply).
-    const grew = prev && info.newCount > 0 && (info.myLast !== prev.myLast ? false : info.newCount > prev.newCount);
-    if (grew || (!prev && flag && info.newCount > 0)) {
+    const grew = prev ? info.myLast === prev.myLast && info.newCount > prev.newCount : flag && info.newCount > 0;
+    if (grew) {
       badge = 'update';
       events.push({ ref, title: pr.title, url: info.latest.url, headline: `${info.latest.author} replied`, detail: info.latest.text });
-    }
-    next[ref] = { title: pr.title, url: pr.url, author: pr.author?.login, ...info, badge };
+    } else if (changed && !badge) badge = 'update'; // e.g. your review was re-requested
+    next[ref] = { title: pr.title, url: pr.url, author: pr.author?.login, ...info, badge, newSteps };
   }
   state.reviewing = next;
   state.init.reviewing = true;
@@ -324,7 +438,7 @@ function dismiss(section, ref) {
   for (const r of ref ? [ref] : Object.keys(bucket)) {
     if (!bucket[r]) continue;
     if (bucket[r].gone) delete bucket[r];
-    else bucket[r].badge = null;
+    else { bucket[r].badge = null; bucket[r].newSteps = []; }
   }
 }
 
@@ -356,6 +470,13 @@ http.createServer(async (req, res) => {
   if (req.method === 'POST' && req.url === '/api/dismiss') {
     const { section, ref } = await body(req); // ref omitted = dismiss all in section; section omitted = everything
     for (const s of section ? [section] : ['prs', 'mentions', 'reviewing']) dismiss(s, ref);
+    save();
+    return json(res, 200, { ok: true });
+  }
+  if (req.method === 'POST' && req.url === '/api/deprioritise') {
+    const { ref, on } = await body(req);
+    state.deprioritised = state.deprioritised.filter(r => r !== ref);
+    if (on && ref) state.deprioritised.push(ref);
     save();
     return json(res, 200, { ok: true });
   }

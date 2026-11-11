@@ -22,3 +22,9 @@ High-risk highlights are left out of the counts because nobody ever resolves the
 
 ## Options (env vars)
 `NOTIFY=banner` uses a Notification Center banner instead of the default dialog · `POLL_MINUTES=5` · `PORT=4777` · `TRACK_MINE=0` tracks only PRs you add.
+
+## Sections
+- **My PRs** grouped by status above. **Mentioned**: open PRs where someone @-mentioned you. **Reviewing**: open PRs by others you commented on or reviewed, with comments posted since your last one.
+- **Next steps**: each PR gets a to-do list built from GitHub data (failing checks, conflicts, unresolved threads, changes requested, pending reviewers). Steps that appeared since the last check are highlighted until you dismiss the PR.
+- **NEW / UPDATE** labels stay until you click Dismiss. A status change triggers a pop-up. Other changes (a new thread or failing check) only flag the row in the dashboard.
+- **Deprioritise** moves a PR into a collapsed group at the bottom of its tab, hides its next steps, leaves it out of counts and stops its pop-ups. **Reprioritise** undoes it.

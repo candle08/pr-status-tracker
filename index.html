@@ -6,9 +6,9 @@
 <title>PR Status Tracker</title>
 <style>
   :root { --bg:#f7f7f8; --card:#fff; --text:#1f2328; --muted:#656d76; --border:#d0d7de; --accent:#0969da;
-          --new:#1a7f37; --new-bg:#dafbe1; --upd:#bf8700; --upd-bg:#fff8c5; }
+          --new:#1a7f37; --new-bg:#dafbe1; --upd:#bf8700; --upd-bg:#fff8c5; --step-bg:#f6f8fa; --depri:#6e7781; }
   @media (prefers-color-scheme: dark) { :root { --bg:#0d1117; --card:#161b22; --text:#e6edf3; --muted:#8d96a0; --border:#30363d; --accent:#4493f8;
-          --new:#3fb950; --new-bg:#12261e; --upd:#d29922; --upd-bg:#2b2111; } }
+          --new:#3fb950; --new-bg:#12261e; --upd:#d29922; --upd-bg:#2b2111; --step-bg:#0d1117; --depri:#8d96a0; } }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
   main { max-width: 1000px; margin: 0 auto; padding: 24px 16px; }
@@ -26,24 +26,41 @@
   .sechead { display:flex; justify-content:space-between; align-items:center; margin:16px 0 4px; gap:8px; }
   .sechead p { margin:0; color:var(--muted); font-size:13px; }
   .group { margin-top: 16px; }
-  .group h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; display:flex; align-items:center; gap:8px; }
+  .group h2, details.depri-group summary { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; display:flex; align-items:center; gap:8px; font-weight:600; }
+  details.depri-group { margin-top: 24px; border-top: 1px dashed var(--border); padding-top: 12px; }
+  details.depri-group summary { cursor:pointer; list-style:none; }
+  details.depri-group summary::before { content:'▸'; }
+  details.depri-group[open] summary::before { content:'▾'; }
   .dot { width:10px; height:10px; border-radius:50%; display:inline-block; flex:none; }
-  .pr { background:var(--card); border:1px solid var(--border); border-left:4px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:6px; display:flex; gap:12px; align-items:center; }
+  .pr { background:var(--card); border:1px solid var(--border); border-left:4px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:8px; }
   .pr.new { border-left-color:var(--new); background:var(--new-bg); }
   .pr.update { border-left-color:var(--upd); background:var(--upd-bg); }
+  .pr.depri { opacity:.7; }
+  .pr .top { display:flex; gap:12px; align-items:flex-start; }
   .pr a { color:var(--text); text-decoration:none; font-weight:600; }
   .pr a:hover { color:var(--accent); }
   .pr .sub { color:var(--muted); font-size:12px; }
-  .pr .quote { font-size:13px; margin-top:4px; overflow-wrap:anywhere; }
-  .pr .quote a { font-weight:400; color:var(--muted); }
   .pr .grow { flex:1; min-width:0; }
-  .pr .actions { display:flex; gap:6px; flex:none; }
+  .pr .actions { display:flex; gap:6px; flex:none; flex-wrap:wrap; justify-content:flex-end; }
   .pr .actions button { padding:3px 8px; font-size:12px; }
   .label { display:inline-block; font-size:11px; font-weight:700; letter-spacing:.04em; padding:1px 7px; border-radius:10px; color:#fff; margin-right:6px; vertical-align:1px; }
   .label.new { background:var(--new); }
   .label.update { background:var(--upd); }
+  .label.depri { background:var(--depri); }
+  .steps { margin-top:8px; background:var(--step-bg); border:1px solid var(--border); border-radius:6px; padding:6px 10px; }
+  .pr.update .steps, .pr.new .steps { border-color:var(--upd); box-shadow:0 0 0 1px var(--upd) inset; }
+  .pr.new .steps { border-color:var(--new); box-shadow:0 0 0 1px var(--new) inset; }
+  .steps h3 { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin:0 0 4px; }
+  .steps ol { margin:0; padding-left:20px; }
+  .steps li { margin:2px 0; font-size:13px; overflow-wrap:anywhere; padding:1px 4px; border-radius:4px; }
+  .steps li.fresh { background:var(--upd-bg); outline:1px solid var(--upd); font-weight:600; }
+  .pr.new .steps li.fresh { background:var(--new-bg); outline-color:var(--new); }
+  .steps li a { font-weight:inherit; color:var(--text); }
+  .steps li a:hover { color:var(--accent); }
+  .steps .tag { font-size:10px; font-weight:700; color:#fff; background:var(--upd); border-radius:8px; padding:0 5px; margin-right:4px; }
+  .pr.new .steps .tag { background:var(--new); }
   .empty { color: var(--muted); padding: 24px 0; }
-  @media (max-width: 600px) { .pr { flex-wrap:wrap; } .pr .actions { width:100%; } }
+  @media (max-width: 600px) { .pr .top { flex-wrap:wrap; } .pr .actions { width:100%; justify-content:flex-start; } }
 </style>
 </head>
 <body>
@@ -76,61 +93,88 @@ const SECTIONS = [
   ['mentions', 'Mentioned'],
   ['reviewing', 'Reviewing'],
 ];
-let tab = 'prs', S = null;
-try { tab = localStorage.getItem('tab') || 'prs'; } catch {}
+let tab = 'prs', S = null, depriOpen = false;
+try { tab = localStorage.getItem('tab') || 'prs'; depriOpen = localStorage.getItem('depriOpen') === '1'; } catch {}
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]));
 const ago = iso => { if (!iso) return 'never'; const m = Math.round((Date.now() - Date.parse(iso)) / 60000); return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m/60)} h ago` : `${Math.round(m/1440)} d ago`; };
-const flagged = sec => Object.values(S?.[sec] || {}).filter(p => p.badge).length;
+const isDepri = ref => (S.deprioritised || []).includes(ref);
+const flagged = sec => Object.entries(S?.[sec] || {}).filter(([ref, p]) => p.badge && !isDepri(ref)).length;
 
-function row(section, ref, p, sub, quote, extra = '') {
-  const label = p.badge ? `<span class="label ${p.badge}">${p.badge === 'new' ? 'NEW' : 'UPDATE'}</span>` : '';
-  const dismissBtn = p.badge ? `<button data-dismiss="${esc(ref)}" data-section="${section}">Dismiss</button>` : '';
-  return `<div class="pr ${p.badge || ''}"><div class="grow">
-      ${label}<a href="${esc(p.url)}" target="_blank">${esc(p.title)}</a>
-      <div class="sub">${sub}</div>${quote || ''}</div>
-      <div class="actions">${dismissBtn}${extra}</div></div>`;
+function stepsBlock(p, depri) {
+  if (depri || !p.steps?.length) return '';
+  const fresh = new Set(p.newSteps || []);
+  return `<div class="steps"><h3>Next steps</h3><ol>${p.steps.map(s => {
+    const isNew = fresh.has(s.id);
+    const text = s.url ? `<a href="${esc(s.url)}" target="_blank">${esc(s.text)}</a>` : esc(s.text);
+    return `<li class="${isNew ? 'fresh' : ''}">${isNew ? '<span class="tag">NEW</span>' : ''}${text}</li>`;
+  }).join('')}</ol></div>`;
 }
-const quoteOf = l => l ? `<div class="quote"><a href="${esc(l.url)}" target="_blank"><b>${esc(l.author)}</b> · ${ago(l.createdAt)}: “${esc(l.text || '…')}”</a></div>` : '';
-const sortFlagged = entries => entries.sort(([, a], [, b]) => (!!b.badge - !!a.badge) || String(b.latest?.createdAt || '').localeCompare(String(a.latest?.createdAt || '')));
+
+function row(section, ref, p, sub, extra = '') {
+  const depri = isDepri(ref);
+  const badge = depri ? null : p.badge;
+  const labels = (badge ? `<span class="label ${badge}">${badge === 'new' ? 'NEW' : 'UPDATE'}</span>` : '')
+    + (depri ? '<span class="label depri">DEPRIORITISED</span>' : '');
+  const btns = (badge ? `<button data-dismiss="${esc(ref)}" data-section="${section}">Dismiss</button>` : '')
+    + `<button data-depri="${esc(ref)}" data-on="${depri ? '0' : '1'}">${depri ? 'Reprioritise' : 'Deprioritise'}</button>` + extra;
+  return `<div class="pr ${badge || ''} ${depri ? 'depri' : ''}"><div class="top"><div class="grow">
+      ${labels}<a href="${esc(p.url)}" target="_blank">${esc(p.title)}</a>
+      <div class="sub">${sub}</div></div>
+      <div class="actions">${btns}</div></div>${stepsBlock(p, depri)}</div>`;
+}
 
 function head(section, blurb) {
   const n = flagged(section);
   return `<div class="sechead"><p>${blurb}</p>${n ? `<button data-dismiss-all="${section}">Dismiss all (${n})</button>` : ''}</div>`;
 }
 
+function depriGroup(rows) {
+  if (!rows.length) return '';
+  return `<details class="depri-group" ${depriOpen ? 'open' : ''}><summary><span class="dot" style="background:var(--depri)"></span>Deprioritised (${rows.length})</summary>${rows.join('')}</details>`;
+}
+
+const flaggedFirst = (a, b) => !!b.badge - !!a.badge;
+
 function renderPRs() {
   const entries = Object.entries(S.prs);
-  let out = head('prs', 'Your open PRs, plus any you track by hand. Flagged rows changed status.');
+  let out = head('prs', 'Your open PRs, plus any you track by hand. Flagged rows changed — new next steps are highlighted.');
   if (!entries.length) return out + '<div class="empty">No PRs tracked yet.</div>';
-  return out + ORDER.map(([status, color]) => {
-    const rows = entries.filter(([, p]) => p.status === status).sort(([, a], [, b]) => !!b.badge - !!a.badge);
+  const sub = (ref, p) => `${esc(ref)} · <b>${esc(p.status)}</b>${p.detail ? ' · ' + esc(p.detail) : ''}${p.badge === 'update' && p.changedFrom && p.changedFrom !== p.status ? ` · was <i>${esc(p.changedFrom)}</i>` : ''} · since ${ago(p.since)}`;
+  const untrack = ref => S.manual.includes(ref) ? `<button data-untrack="${esc(ref)}">Untrack</button>` : '';
+  const active = entries.filter(([ref]) => !isDepri(ref));
+  out += ORDER.map(([status, color]) => {
+    const rows = active.filter(([, p]) => p.status === status).sort(([, a], [, b]) => flaggedFirst(a, b));
     if (!rows.length) return '';
     return `<div class="group"><h2><span class="dot" style="background:${color}"></span>${esc(status)} (${rows.length})</h2>` +
-      rows.map(([ref, p]) => row('prs', ref, p,
-        `${esc(ref)}${p.detail ? ' · ' + esc(p.detail) : ''}${p.badge === 'update' && p.changedFrom ? ` · was <i>${esc(p.changedFrom)}</i>` : ''} · since ${ago(p.since)}`,
-        '', S.manual.includes(ref) ? `<button data-untrack="${esc(ref)}">Untrack</button>` : '')).join('') + '</div>';
+      rows.map(([ref, p]) => row('prs', ref, p, sub(ref, p), untrack(ref))).join('') + '</div>';
   }).join('');
+  if (!active.length) out += '<div class="empty">Everything is deprioritised.</div>';
+  return out + depriGroup(entries.filter(([ref]) => isDepri(ref)).map(([ref, p]) => row('prs', ref, p, sub(ref, p), untrack(ref))));
 }
 
-function renderMentions() {
-  const entries = sortFlagged(Object.entries(S.mentions));
-  let out = head('mentions', 'Open PRs where someone @-mentioned you in the description or a comment.');
-  if (!entries.length) return out + '<div class="empty">No open PRs mention you.</div>';
-  return out + entries.map(([ref, p]) => row('mentions', ref, p,
-    `${esc(ref)} · by ${esc(p.author)} · ${p.count} mention${p.count === 1 ? '' : 's'}${p.latest ? ` · latest in ${p.latest.where}` : ''}`,
-    quoteOf(p.latest))).join('');
+function renderList(section, blurb, emptyText, subFn, sortFn) {
+  const entries = Object.entries(S[section]).sort(([, a], [, b]) => flaggedFirst(a, b) || sortFn(a, b));
+  let out = head(section, blurb);
+  if (!entries.length) return out + `<div class="empty">${emptyText}</div>`;
+  const active = entries.filter(([ref]) => !isDepri(ref));
+  out += active.map(([ref, p]) => row(section, ref, p, subFn(ref, p))).join('');
+  if (!active.length) out += '<div class="empty">Everything is deprioritised.</div>';
+  return out + depriGroup(entries.filter(([ref]) => isDepri(ref)).map(([ref, p]) => row(section, ref, p, subFn(ref, p))));
 }
 
-function renderReviewing() {
-  const entries = sortFlagged(Object.entries(S.reviewing)).sort(([, a], [, b]) => (!!b.badge - !!a.badge) || (b.newCount - a.newCount));
-  let out = head('reviewing', 'Open PRs by others that you commented on or reviewed. Shows comments posted since your last one.');
-  if (!entries.length) return out + '<div class="empty">You haven’t commented on any open PRs.</div>';
-  return out + entries.map(([ref, p]) => row('reviewing', ref, p,
-    `${esc(ref)} · by ${esc(p.author)} · ${p.newCount ? `<b>${p.newCount} new since your last comment</b>` : 'no new replies'}${p.myLast ? ` · you last commented ${ago(p.myLast)}` : ''}`,
-    p.newCount ? quoteOf(p.latest) : '')).join('');
-}
+const renderMentions = () => renderList('mentions',
+  'Open PRs where someone @-mentioned you in the description or a comment.',
+  'No open PRs mention you.',
+  (ref, p) => `${esc(ref)} · by ${esc(p.author)} · ${p.count} mention${p.count === 1 ? '' : 's'}${p.latest ? ` · latest ${ago(p.latest.createdAt)} by ${esc(p.latest.author)}` : ''}`,
+  (a, b) => String(b.latest?.createdAt || '').localeCompare(String(a.latest?.createdAt || '')));
+
+const renderReviewing = () => renderList('reviewing',
+  'Open PRs by others that you commented on or reviewed. Shows comments posted since your last one.',
+  'You haven’t commented on any open PRs.',
+  (ref, p) => `${esc(ref)} · by ${esc(p.author)} · ${p.newCount ? `<b>${p.newCount} new since your last comment</b>` : 'no new replies'}${p.myLast ? ` · you last commented ${ago(p.myLast)}` : ''}`,
+  (a, b) => b.newCount - a.newCount);
 
 function render() {
   if (!S) return;
@@ -140,9 +184,12 @@ function render() {
   $('err').textContent = S.lastError ? `Last poll failed: ${S.lastError}` : '';
   $('tabs').innerHTML = SECTIONS.map(([k, name]) => {
     const n = flagged(k);
-    return `<button class="tab ${tab === k ? 'on' : ''}" data-tab="${k}">${name} (${Object.keys(S[k] || {}).length})${n ? `<span class="count">${n}</span>` : ''}</button>`;
+    const active = Object.keys(S[k] || {}).filter(r => !isDepri(r)).length;
+    return `<button class="tab ${tab === k ? 'on' : ''}" data-tab="${k}">${name} (${active})${n ? `<span class="count">${n}</span>` : ''}</button>`;
   }).join('');
   $('list').innerHTML = { prs: renderPRs, mentions: renderMentions, reviewing: renderReviewing }[tab]();
+  const d = document.querySelector('details.depri-group');
+  if (d) d.ontoggle = () => { depriOpen = d.open; try { localStorage.setItem('depriOpen', depriOpen ? '1' : '0'); } catch {} };
 }
 
 async function load() { S = await (await fetch('/api/state')).json(); render(); }
@@ -163,6 +210,7 @@ $('list').onclick = async e => {
   if (d.dismiss) await post('/api/dismiss', { section: d.section, ref: d.dismiss });
   else if (d.dismissAll) await post('/api/dismiss', { section: d.dismissAll });
   else if (d.untrack) await post('/api/remove', { ref: d.untrack });
+  else if (d.depri) await post('/api/deprioritise', { ref: d.depri, on: d.on === '1' });
   else return;
   load();
 };
