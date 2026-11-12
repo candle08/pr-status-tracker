@@ -338,6 +338,16 @@ async function pollMyPRs(events) {
     if (!status) pending = true;
     const next = status || prev.status;
     const steps = nextStepsForMine(pr, next);
+    // While GitHub recomputes mergeability (UNKNOWN), we can't tell whether conflicts/behind still
+    // apply. Keep the previous answer — otherwise the step vanishes for one poll, comes back the
+    // next, and counts as "new", re-flagging a PR you already dismissed.
+    if (pr.mergeable === 'UNKNOWN' || pr.mergeStateStatus === 'UNKNOWN') {
+      const kept = (prev?.steps || []).filter(s => s.id === 'conflicts' || s.id === 'behind');
+      if (kept.length) {
+        const rest = steps.filter(s => s.id !== 'conflicts' && s.id !== 'behind' && s.id !== 'none');
+        steps.splice(0, steps.length, ...kept, ...rest);
+      }
+    }
     const { newSteps, changed } = diffSteps(prev, steps, flag);
     let badge = prev?.badge || null;
     if (prev && prev.status !== next) {
